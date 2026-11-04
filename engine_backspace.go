@@ -40,6 +40,10 @@ func (e *IBusBambooEngine) bsProcessKeyEvent(keyVal uint32, keyCode uint32, stat
 		e.isSurroundingTextReady = true
 		return false, nil
 	}
+	// GOTV: capture the focus/field generation at entry, before any wait or
+	// processing, so the key is tagged with the field it was pressed in (not
+	// the field that happens to be focused later).
+	var gen = e.currentInputGen()
 	var keyRune = rune(keyVal)
 	if e.config.IBflags&config.IBmacroEnabled == 0 && len(keyPressChan) == 0 && e.getRawKeyLen() == 0 && !inKeyList(e.preeditor.GetInputMethod().AppendingKeys, keyRune) {
 		e.updateLastKeyWithShift(keyVal, state)
@@ -83,26 +87,48 @@ func (e *IBusBambooEngine) bsProcessKeyEvent(keyVal uint32, keyCode uint32, stat
 			isValidKey := isValidState(state) && e.isValidKeyVal(keyVal)
 			if !isValidKey {
 				sleep()
-				return e.keyPressHandler(keyVal, keyCode, state), nil
+				// GOTV: same stale drop semantics as the queued path — a key
+				// whose field changed while it was processed must not fall
+				// through to the client (which would type it into the new field).
+				ret := e.keyPressHandler(keyVal, keyCode, state, gen)
+				if !ret && e.isCurrentInputGen(gen) {
+					return false, nil
+				}
+				return true, nil
 			}
 		}
 		// if the main thread is busy processing, the keypress events come all mixed up
-		// so we enqueue these keypress events and process them sequentially on another thread
-		keyPressChan <- [3]uint32{keyVal, keyCode, state}
+		// so we enqueue these keypress events (tagged with the entry focus
+		// generation) and process them sequentially on another thread
+		keyPressChan <- keyPressEvent{keyVal, keyCode, state, gen}
 		return true, nil
 	} else {
-		return e.keyPressHandler(keyVal, keyCode, state), nil
+		// GOTV: same stale drop semantics as the queued path.
+		ret := e.keyPressHandler(keyVal, keyCode, state, gen)
+		if !ret && e.isCurrentInputGen(gen) {
+			return false, nil
+		}
+		return true, nil
 	}
 }
 
-func (e *IBusBambooEngine) keyPressForwardHandler(keyVal, keyCode, state uint32) {
-	ret := e.keyPressHandler(keyVal, keyCode, state)
+func (e *IBusBambooEngine) keyPressForwardHandler(keyVal, keyCode, state uint32, gen uint64) {
+	ret := e.keyPressHandler(keyVal, keyCode, state, gen)
 	if !ret {
-		e.ForwardKeyEvent(keyVal, keyCode, state)
+		// GOTV: the field may have changed while the handler was working; drop
+		// instead of forwarding a stale key into the field that now has focus.
+		if e.isCurrentInputGen(gen) {
+			e.ForwardKeyEvent(keyVal, keyCode, state)
+		}
 	}
 }
 
-func (e *IBusBambooEngine) keyPressHandler(keyVal, keyCode, state uint32) bool {
+func (e *IBusBambooEngine) keyPressHandler(keyVal, keyCode, state uint32, gen uint64) bool {
+	// GOTV: a focus/field change while the key was queued invalidates it — it
+	// belongs to the previous field, never compose/rewrite it into the new one.
+	if !e.isCurrentInputGen(gen) {
+		return true
+	}
 	// log.Printf(">>Backspace:ProcessKeyEvent >  %c | keyCode 0x%04x keyVal 0x%04x | %d\n", rune(keyVal), keyCode, keyVal, len(keyPressChan))
 	defer e.updateLastKeyWithShift(keyVal, state)
 	if e.keyPressDelay > 0 {
@@ -202,7 +228,7 @@ func (e *IBusBambooEngine) updatePreviousTextInBatch(oldText, newText string, is
 	var isDirty = false
 	for i := 0; i < len(keyPressChan); i++ {
 		var keyEvents = <-keyPressChan
-		var keyVal, keyCode, state = keyEvents[0], keyEvents[1], keyEvents[2]
+		var keyVal, keyCode, state = keyEvents.keyVal, keyEvents.keyCode, keyEvents.state
 		isValidKey := isValidState(state) && e.isValidKeyVal(keyVal)
 		if isValidKey {
 			var commitText, isWordBreakRune0 = e.getCommitText(keyVal, keyCode, state)

@@ -62,6 +62,15 @@ type IBusBambooEngine struct {
 	shouldRestoreKeyStrokes bool
 	// enqueue key strokes to process later
 	shouldEnqueuKeyStrokes bool
+	// GOTV: focus/field generation. Bumped whenever the focused field changes
+	// (FocusIn/FocusOut) or a password field is entered; queued/in-flight keys
+	// tagged with an older generation are dropped instead of being composed
+	// into the wrong field (which lost characters).
+	inputGen uint64
+	// GOTV: purpose/hints of the focused field, pushed by ibus-daemon via
+	// Properties.Set("ContentType", (uu)).
+	contentPurpose uint32
+	contentHints   uint32
 }
 
 func NewIbusBambooEngine(name string, cfg *config.Config, base IEngine, preeditor bamboo.IEngine) *IBusBambooEngine {
@@ -97,6 +106,10 @@ func (e *IBusBambooEngine) ProcessKeyEvent(keyVal uint32, keyCode uint32, state 
 		// fmt.Println("Ignore key-up event")
 		return false, nil
 	}
+	// GOTV: skip all Vietnamese processing in password/PIN fields.
+	if e.isPasswordField() {
+		return false, nil
+	}
 	fmt.Printf("\n")
 	log.Printf(">>>>ProcessKeyEvent >  %d | state %d keyVal 0x%04x | %c <<<<\n", len(keyPressChan), state, keyVal, rune(keyVal))
 	if ret, retValue := e.processShortcutKey(keyVal, keyCode, state); ret {
@@ -112,6 +125,13 @@ func (e *IBusBambooEngine) FocusIn() *dbus.Error {
 	log.Print("FocusIn.")
 	var latestWm = e.getLatestWmClass()
 	e.checkWmClass(latestWm)
+	// GOTV: reset the SUT shadow per field — wm_class is empty on Wayland, so
+	// checkWmClass never fires and stale state would leak across fields.
+	// invalidatePendingKeys bumps the generation and drops every queued key so
+	// a rewrite left mid-flight by the worker can never leak into this field.
+	if e.inBackspaceWhiteList() {
+		e.invalidatePendingKeys()
+	}
 	e.RegisterProperties(e.propList)
 	e.RequireSurroundingText()
 	if e.isShortcutKeyEnable(KSEmojiDialog) && emojiTrie != nil && len(emojiTrie.Children) == 0 {
@@ -130,6 +150,12 @@ func (e *IBusBambooEngine) FocusIn() *dbus.Error {
 
 func (e *IBusBambooEngine) FocusOut() *dbus.Error {
 	log.Print("FocusOut.")
+	// GOTV: no pending composition in SUT mode; invalidatePendingKeys resets
+	// the shadow AND bumps the generation so queued keys are never drained
+	// into (or rewritten against) the next field.
+	if e.inBackspaceWhiteList() {
+		e.invalidatePendingKeys()
+	}
 	return nil
 }
 
@@ -248,6 +274,9 @@ func (e *IBusBambooEngine) SetCursorLocation(x int32, y int32, w int32, h int32)
 }
 
 func (e *IBusBambooEngine) SetContentType(purpose uint32, hints uint32) *dbus.Error {
+	// GOTV: kept for older daemons; current ibus-daemon pushes via Properties.Set.
+	e.setContentType(purpose, hints)
+	log.Print("[via engine.SetContentType]")
 	return nil
 }
 
