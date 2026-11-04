@@ -24,6 +24,7 @@ import (
 	"ibus-bamboo/config"
 	"ibus-bamboo/ui"
 	"io/ioutil"
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -49,6 +50,7 @@ func GetIBusEngineCreator() func(*dbus.Conn, string) dbus.ObjectPath {
 		fmt.Printf("Got engine name: %s", engineName)
 		var cfg = config.LoadConfig(engineName)
 		var objectPath = dbus.ObjectPath(fmt.Sprintf("/org/freedesktop/IBus/Engine/%s/%d", engineName, time.Now().UnixNano()))
+		log.Printf("Engine object path: %s", objectPath)
 		var inputMethod = bamboo.ParseInputMethod(cfg.InputMethodDefinitions, cfg.InputMethod)
 		baseEngine := ibus.BaseEngine(conn, objectPath)
 		var engine = NewIbusBambooEngine(engineName, config.LoadConfig(engineName), &baseEngine, bamboo.NewEngine(inputMethod, cfg.Flags))
@@ -108,16 +110,26 @@ func initConfigFiles(engineName string) {
 	}
 }
 
-var keyPressHandler = func(keyVal, keyCode, state uint32) {}
-var keyPressChan = make(chan [3]uint32, 100)
+var keyPressHandler = func(keyVal, keyCode, state uint32, gen uint64) {}
+var keyPressChan = make(chan keyPressEvent, 100)
 var lenKeyChan int32
 
+// keyPressEvent tags a queued keystroke with its focus/field generation.
+type keyPressEvent struct {
+	keyVal, keyCode, state uint32
+	gen                    uint64
+}
+
 func keyPressCapturing() {
-	for keyEvents := range keyPressChan {
+	for event := range keyPressChan {
 		atomic.StoreInt32(&lenKeyChan, int32(len(keyPressChan)))
 
-		var keyVal, keyCode, state = keyEvents[0], keyEvents[1], keyEvents[2]
-		keyPressHandler(keyVal, keyCode, state)
+		keyPressHandler(
+			event.keyVal,
+			event.keyCode,
+			event.state,
+			event.gen,
+		)
 
 		atomic.AddInt32(&lenKeyChan, -1)
 	}
@@ -129,6 +141,35 @@ var sleep = func() {
 		i++
 		time.Sleep(5 * time.Millisecond)
 	}
+}
+
+// invalidatePendingKeys invalidates keys from the previous field and resets composition.
+func (e *IBusBambooEngine) invalidatePendingKeys() {
+	e.Lock()
+	e.inputGen++
+	e.isSurroundingTextReady = false
+	e.shouldRestoreKeyStrokes = false
+	e.preeditor.Reset()
+	e.resetFakeBackspace()
+	e.Unlock()
+
+	// Do not drain here: a concurrent producer may already have queued keys
+	// from the new generation. The consumer rejects stale events instead.
+}
+
+// currentInputGen returns the current focus/field generation.
+func (e *IBusBambooEngine) currentInputGen() uint64 {
+	e.Lock()
+	defer e.Unlock()
+	return e.inputGen
+}
+
+// isCurrentInputGen reports whether an enqueued event still belongs to the
+// current focus/field generation (i.e., was not invalidated meanwhile).
+func (e *IBusBambooEngine) isCurrentInputGen(gen uint64) bool {
+	e.Lock()
+	defer e.Unlock()
+	return gen == e.inputGen
 }
 
 func (e *IBusBambooEngine) resetBuffer() {

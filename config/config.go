@@ -52,8 +52,10 @@ func DefaultCfg() Config {
 		Flags:                  bamboo.EstdFlags,
 		IBflags:                IBstdFlags,
 		Shortcuts:              [10]uint32{1, 126, 0, 0, 0, 0, 0, 0, 5, 117},
-		DefaultInputMode:       PreeditIM,
-		InputModeMapping:       map[string]int{},
+		// GOTV: no-underline mode out of the box — users should not have to
+		// configure an input mode to get the fork's core behavior.
+		DefaultInputMode: BackspaceForwardingIM,
+		InputModeMapping: map[string]int{},
 	}
 }
 
