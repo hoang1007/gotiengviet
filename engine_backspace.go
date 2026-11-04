@@ -87,11 +87,11 @@ func (e *IBusBambooEngine) bsProcessKeyEvent(keyVal uint32, keyCode uint32, stat
 			isValidKey := isValidState(state) && e.isValidKeyVal(keyVal)
 			if !isValidKey {
 				sleep()
-				// GOTV: same stale drop semantics as the queued path — a key
-				// whose field changed while it was processed must not fall
+				// GOTV: same stale/password drop semantics as the queued path —
+				// a key whose field changed while it was processed must not fall
 				// through to the client (which would type it into the new field).
 				ret := e.keyPressHandler(keyVal, keyCode, state, gen)
-				if !ret && e.isCurrentInputGen(gen) {
+				if !ret && e.isCurrentInputGen(gen) && !e.isPasswordField() {
 					return false, nil
 				}
 				return true, nil
@@ -103,9 +103,9 @@ func (e *IBusBambooEngine) bsProcessKeyEvent(keyVal uint32, keyCode uint32, stat
 		keyPressChan <- keyPressEvent{keyVal, keyCode, state, gen}
 		return true, nil
 	} else {
-		// GOTV: same stale drop semantics as the queued path.
+		// GOTV: same stale/password drop semantics as the queued path.
 		ret := e.keyPressHandler(keyVal, keyCode, state, gen)
-		if !ret && e.isCurrentInputGen(gen) {
+		if !ret && e.isCurrentInputGen(gen) && !e.isPasswordField() {
 			return false, nil
 		}
 		return true, nil
@@ -117,7 +117,7 @@ func (e *IBusBambooEngine) keyPressForwardHandler(keyVal, keyCode, state uint32,
 	if !ret {
 		// GOTV: the field may have changed while the handler was working; drop
 		// instead of forwarding a stale key into the field that now has focus.
-		if e.isCurrentInputGen(gen) {
+		if e.isCurrentInputGen(gen) && !e.isPasswordField() {
 			e.ForwardKeyEvent(keyVal, keyCode, state)
 		}
 	}
@@ -127,6 +127,11 @@ func (e *IBusBambooEngine) keyPressHandler(keyVal, keyCode, state uint32, gen ui
 	// GOTV: a focus/field change while the key was queued invalidates it — it
 	// belongs to the previous field, never compose/rewrite it into the new one.
 	if !e.isCurrentInputGen(gen) {
+		return true
+	}
+	// GOTV: even if this key was queued before the field switched, never compose
+	// or commit into a password field once the worker reaches it.
+	if e.isPasswordField() {
 		return true
 	}
 	// log.Printf(">>Backspace:ProcessKeyEvent >  %c | keyCode 0x%04x keyVal 0x%04x | %d\n", rune(keyVal), keyCode, keyVal, len(keyPressChan))
@@ -147,7 +152,7 @@ func (e *IBusBambooEngine) keyPressHandler(keyVal, keyCode, state uint32, gen ui
 			var newText = e.getPreeditString()
 			var offset = e.getPreeditOffset([]rune(newText), []rune(oldText))
 			if oldText != "" && offset != len([]rune(newText)) {
-				e.updatePreviousText(oldText, newText)
+				e.updatePreviousText(oldText, newText, gen)
 				return true
 			}
 		}
@@ -157,7 +162,7 @@ func (e *IBusBambooEngine) keyPressHandler(keyVal, keyCode, state uint32, gen ui
 	if keyVal == IBusTab {
 		defer e.preeditor.Reset()
 		if oldMacText != "" {
-			e.updatePreviousText(oldText, oldMacText)
+			e.updatePreviousText(oldText, oldMacText, gen)
 			return true
 		}
 		return false
@@ -166,14 +171,27 @@ func (e *IBusBambooEngine) keyPressHandler(keyVal, keyCode, state uint32, gen ui
 	isValidKey := isValidState(state) && e.isValidKeyVal(keyVal)
 	newText, isWordBreakRune := e.getCommitText(keyVal, keyCode, state)
 	if len(newText) > 0 {
+		// GOTV: re-validate before any output — composing the key may take long
+		// enough that focus changed or a password field appeared; abort so we
+		// never send backspaces into / commit into the field that now has focus.
+		if !e.isCurrentInputGen(gen) || e.isPasswordField() {
+			return isValidKey
+		}
 		if e.shouldAppendDeadKey(newText, oldText) {
 			fmt.Println("Append a deadkey")
 			e.bsCommitText([]rune(" "))
 			time.Sleep(10 * time.Millisecond)
 			e.isFirstTimeSendingBS = false
-			e.SendBackSpace(1)
+			e.SendBackSpace(1, gen)
 		}
-		e.updatePreviousTextInBatch(oldText, newText, isWordBreakRune)
+		// GOTV: batch-commit the whole word at once. updatePreviousTextInBatch
+		// applies this key's rewrite and drain-commits every keystroke already
+		// queued, delivering the accumulated text in ONE commitText at the next
+		// word break (or when the queue drains). Batching avoids the
+		// stand-alone multi-run commit that lands right after forwarded
+		// backspaces, which GTK/Qt drop at fast typing rates — the source of
+		// the reported character loss (thấy→thy, mất→mt).
+		e.updatePreviousTextInBatch(oldText, newText, isWordBreakRune, gen)
 		return isValidKey
 	}
 	return isValidKey
@@ -205,19 +223,21 @@ func (e *IBusBambooEngine) shouldAppendDeadKey(newText, oldText string) bool {
 	return false
 }
 
-func (e *IBusBambooEngine) updatePreviousText(oldText, newText string) {
+// updatePreviousTextInBatch applies one key's committed-text update and
+// batch-drains every keystroke already queued, committing the whole word in ONE
+// commitText at the next word break (or when the queue drains). Batching
+// avoids the stand-alone multi-run commit that would otherwise land right after
+// forwarded backspaces, which GTK/Qt drop at fast typing rates — the source of
+// the reported character loss (thấy→thy, mất→mt).
+func (e *IBusBambooEngine) updatePreviousTextInBatch(oldText, newText string, isWordBreakRune bool, gen uint64) {
 	offsetRunes, nBackSpace := e.getOffsetRunes(newText, oldText)
 	if nBackSpace > 0 {
-		e.SendBackSpace(nBackSpace)
-	}
-	log.Printf("Updating Previous Text %s ---> %s\n", oldText, newText)
-	e.bsCommitText(offsetRunes)
-}
-
-func (e *IBusBambooEngine) updatePreviousTextInBatch(oldText, newText string, isWordBreakRune bool) {
-	offsetRunes, nBackSpace := e.getOffsetRunes(newText, oldText)
-	if nBackSpace > 0 {
-		e.SendBackSpace(nBackSpace)
+		e.SendBackSpace(nBackSpace, gen)
+		// GOTV: re-validate after the (long) backspace window — the field may
+		// have changed or become a password field mid-rewrite.
+		if !e.isCurrentInputGen(gen) || e.isPasswordField() {
+			return
+		}
 	}
 	var buffer = []string{string(offsetRunes)}
 	if isWordBreakRune {
@@ -228,6 +248,11 @@ func (e *IBusBambooEngine) updatePreviousTextInBatch(oldText, newText string, is
 	var isDirty = false
 	for i := 0; i < len(keyPressChan); i++ {
 		var keyEvents = <-keyPressChan
+		// GOTV: drop keys queued under a previous focus generation — never
+		// compose them against the field that now has focus.
+		if !e.isCurrentInputGen(keyEvents.gen) {
+			continue
+		}
 		var keyVal, keyCode, state = keyEvents.keyVal, keyEvents.keyCode, keyEvents.state
 		isValidKey := isValidState(state) && e.isValidKeyVal(keyVal)
 		if isValidKey {
@@ -239,24 +264,30 @@ func (e *IBusBambooEngine) updatePreviousTextInBatch(oldText, newText string, is
 			isDirty = true
 		} else {
 			if isDirty {
-				e.batchCommit(oldText, strings.Join(buffer, ""), nBackSpace, isWordBreakRune)
+				e.batchCommit(oldText, strings.Join(buffer, ""), nBackSpace, isWordBreakRune, gen)
 				buffer = []string{""}
 			}
 			e.ForwardKeyEvent(keyVal, keyCode, state)
 		}
 	}
 	if isDirty {
-		e.batchCommit(oldText, strings.Join(buffer, ""), nBackSpace, isWordBreakRune)
+		e.batchCommit(oldText, strings.Join(buffer, ""), nBackSpace, isWordBreakRune, gen)
 		return
 	}
 	log.Printf("Updating Previous Text %s ---> %s\n", oldText, newText)
 	e.bsCommitText(offsetRunes)
 }
 
-// batchCommit compares two given text and commit the right outer text, with backspaces if necessary
+// batchCommit compares two given text and commit the right outer text, with
+// backspaces if necessary:
 // toi - tôi = ôi + 2 BS
 // <space> - tôi = tôi
-func (e *IBusBambooEngine) batchCommit(oldText string, newText string, nBackSpace int, isWordBreakRune bool) {
+func (e *IBusBambooEngine) batchCommit(oldText string, newText string, nBackSpace int, isWordBreakRune bool, gen uint64) {
+	// GOTV: re-validate before emitting anything — abort if the field changed
+	// or became a password field while draining/rewriting.
+	if !e.isCurrentInputGen(gen) || e.isPasswordField() {
+		return
+	}
 	fullRunes := []rune(newText)
 	if len(fullRunes) == 0 {
 		return
@@ -267,7 +298,7 @@ func (e *IBusBambooEngine) batchCommit(oldText string, newText string, nBackSpac
 		return
 	}
 	if patchedBackSpace > nBackSpace {
-		e.SendBackSpace(patchedBackSpace - nBackSpace)
+		e.SendBackSpace(patchedBackSpace-nBackSpace, gen)
 	} else if patchedBackSpace < nBackSpace {
 		var offset = utf8.RuneCountInString(oldText) - nBackSpace
 		patchedRunes = fullRunes[offset:]
@@ -275,6 +306,23 @@ func (e *IBusBambooEngine) batchCommit(oldText string, newText string, nBackSpac
 	log.Printf("\nUpdating Previous Text %s ---> %s\n", oldText, newText)
 	fmt.Print("====================================\n\n")
 	e.bsCommitText(patchedRunes)
+}
+
+// updatePreviousText applies a rewrite immediately (no deferral) — used only
+// by Backspace/Tab key handling where the user expects the change at once.
+func (e *IBusBambooEngine) updatePreviousText(oldText, newText string, gen uint64) {
+	offsetRunes, nBackSpace := e.getOffsetRunes(newText, oldText)
+	if nBackSpace > 0 {
+		if !e.isCurrentInputGen(gen) || e.isPasswordField() {
+			return
+		}
+		e.SendBackSpace(nBackSpace, gen)
+	}
+	if !e.isCurrentInputGen(gen) || e.isPasswordField() {
+		return
+	}
+	log.Printf("Updating Previous Text %s ---> %s\n", oldText, newText)
+	e.bsCommitText(offsetRunes)
 }
 
 // getOffsetRunes returns the right outer text and number of pending backspaces
@@ -290,7 +338,15 @@ func (e *IBusBambooEngine) getOffsetRunes(newText, oldText string) ([]rune, int)
 	return newRunes[offset:], nBackSpace
 }
 
-func (e *IBusBambooEngine) SendBackSpace(n int) {
+func (e *IBusBambooEngine) SendBackSpace(n int, gen uint64) {
+	// GOTV: guard revalidates the focus/field generation and password state
+	// right before emitting, after the throttling waits. Sending a backspace
+	// that started before a focus/password change would otherwise delete
+	// characters from the field that now has focus — precisely the reported
+	// "mất ký tự" bug.
+	guard := func() bool {
+		return e.isCurrentInputGen(gen) && !e.isPasswordField()
+	}
 	// Gtk/Qt apps have a serious sync issue with fake backspaces
 	// and normal string committing, so we'll not commit right now
 	// but delay until all the sent backspaces got processed.
@@ -298,6 +354,9 @@ func (e *IBusBambooEngine) SendBackSpace(n int) {
 	var delta = 50*1000*1000 - (now.UnixNano() - e.lastCommitText)
 	if delta > 0 {
 		time.Sleep(time.Duration(delta) * time.Nanosecond)
+	}
+	if !guard() {
+		return
 	}
 	if e.checkInputMode(config.XTestFakeKeyEventIM) {
 		e.setFakeBackspace(int32(n))
@@ -310,18 +369,27 @@ func (e *IBusBambooEngine) SendBackSpace(n int) {
 		}
 		log.Printf("Sendding %d backspace via XTestFakeKeyEvent\n", n)
 		time.Sleep(10 * time.Millisecond)
+		if !guard() {
+			return
+		}
 		x11SendBackspace(n, 0)
 		sleep()
 		time.Sleep(time.Duration(n) * (10 + BACKSPACE_INTERVAL) * time.Millisecond)
 	} else if e.checkInputMode(config.SurroundingTextIM) {
 		time.Sleep(20 * time.Millisecond)
 		log.Printf("Sendding %d backspace via SurroundingText\n", n)
+		if !guard() {
+			return
+		}
 		e.DeleteSurroundingText(-int32(n), uint32(n))
 		time.Sleep(20 * time.Millisecond)
 	} else if e.checkInputMode(config.ForwardAsCommitIM) {
 		time.Sleep(20 * time.Millisecond)
 		log.Printf("Sendding %d backspace via forwardAsCommitIM\n", n)
 		for i := 0; i < n; i++ {
+			if !guard() {
+				return
+			}
 			e.ForwardKeyEvent(IBusBackSpace, XkBackspace-8, 0)
 			e.ForwardKeyEvent(IBusBackSpace, XkBackspace-8, IBusReleaseMask)
 		}
@@ -331,6 +399,9 @@ func (e *IBusBambooEngine) SendBackSpace(n int) {
 		log.Printf("Sendding %d Shift+Left via shiftLeftForwardingIM\n", n)
 
 		for i := 0; i < n; i++ {
+			if !guard() {
+				return
+			}
 			e.ForwardKeyEvent(IBusLeft, XkLeft-8, IBusShiftMask)
 			e.ForwardKeyEvent(IBusLeft, XkLeft-8, IBusReleaseMask)
 		}
@@ -340,6 +411,9 @@ func (e *IBusBambooEngine) SendBackSpace(n int) {
 		log.Printf("Sendding %d backspace via backspaceForwardingIM\n", n)
 
 		for i := 0; i < n; i++ {
+			if !guard() {
+				return
+			}
 			e.ForwardKeyEvent(IBusBackSpace, XkBackspace-8, 0)
 			e.ForwardKeyEvent(IBusBackSpace, XkBackspace-8, IBusReleaseMask)
 		}
