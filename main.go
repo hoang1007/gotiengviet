@@ -45,6 +45,16 @@ func hasGnome(env string) bool {
 }
 
 func main() {
+	// GOTV debug: ibus-daemon discards engine stdout/stderr, so GOTV_DEBUG_LOG=1
+	// redirects logging to a file (log captured os.Stderr at init → SetOutput).
+	if os.Getenv("GOTV_DEBUG_LOG") != "" {
+		if f, err := os.OpenFile("/tmp/bamboo-engine.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
+			os.Stdout = f
+			os.Stderr = f
+			log.SetOutput(f)
+		}
+		log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	}
 	if os.Getenv("WAYLAND_DISPLAY") != "" {
 		isWayland = true
 	}
