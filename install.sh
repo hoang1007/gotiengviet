@@ -6,7 +6,7 @@
 # real keyboard device, so they install the engine only.
 set -euo pipefail
 
-release=v0.8.5-gotv1
+release=release/v0.8.5-gotv1
 base="https://github.com/hoang1007/gotiengviet/releases/download/$release"
 mutter_base=50.1-0ubuntu2.5
 mutter_version="${mutter_base}+gotv1"

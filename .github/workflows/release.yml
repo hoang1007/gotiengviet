@@ -1,0 +1,159 @@
+name: Release GoTiengViet
+
+on:
+  push:
+    tags:
+      - "release/*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (the <version> in release/<version>)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ github.event_name == 'push' && github.ref_name || format('release/{0}', inputs.version) }}
+  VERSION: ${{ github.event_name == 'push' && github.ref_name || inputs.version }}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build-engine:
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ["22.04", "24.04", "26.04"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Derive version from tag
+        run: |
+          VER="${VERSION#release/}"
+          DEBVER="${VER#v}"
+          DEBVER="${DEBVER/-gotv1/+gotv1}-1"
+          echo "VER=$VER" >> "$GITHUB_ENV"
+          echo "DEBVER=$DEBVER" >> "$GITHUB_ENV"
+
+      - name: Build .deb on Ubuntu ${{ matrix.release }}
+        run: |
+          mkdir -p dist
+          docker run --rm \
+            -v "$PWD:/src:ro" -v "$PWD/dist:/out" \
+            -e GOTV_RELEASE=${{ matrix.release }} \
+            ubuntu:${{ matrix.release }} bash -c '
+              set -e
+              apt-get update -qq
+              DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+                golang-go build-essential pkg-config debhelper \
+                libibus-1.0-dev libgtk-3-dev libx11-dev libxtst-dev dpkg-dev
+              cd /src
+              make test
+              bash scripts/build-gotv-deb.sh /out'
+
+      - name: Verify expected .deb name (Ubuntu ${{ matrix.release }})
+        run: |
+          cd dist
+          if [[ '${{ matrix.release }}' == '26.04' ]]; then
+            test -f "ibus-bamboo_${DEBVER}_amd64.deb"
+          else
+            test -f "ibus-bamboo_${DEBVER}~${{ matrix.release }}_amd64.deb"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: engine-deb-${{ matrix.release }}
+          path: dist/*.deb
+          if-no-files-found: error
+
+  build-mutter:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build mutter 570de65 backport inside Ubuntu 26.04
+        run: |
+          mkdir -p mutter-dist
+          docker run --rm \
+            -v "$PWD:/src:ro" -v "$PWD/mutter-dist:/out" \
+            ubuntu:26.04 bash -c '
+              set -e
+              apt-get update -qq
+              DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+                sudo dpkg-dev patch debhelper pkg-config \
+                libmutter-18-0 mutter-common gir1.2-mutter-18
+              cd /src
+              export WORK_DIR=/var/tmp/gotv-mutter-fix
+              bash scripts/mutter-fix.sh build
+              for p in libmutter-18-0 mutter-common gir1.2-mutter-18; do
+                cp "$WORK_DIR"/${p}_*+gotv1_*.deb /out/
+              done'
+
+      - name: Verify mutter artifacts
+        run: |
+          ls -la mutter-dist
+          [[ $(ls mutter-dist/*.deb | wc -l) -ge 3 ]]
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mutter-debs
+          path: mutter-dist/*.deb
+          if-no-files-found: error
+
+  publish:
+    needs: [build-engine, build-mutter]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Derive version from tag
+        run: |
+          VER="${VERSION#release/}"
+          DEBVER="${VER#v}"
+          DEBVER="${DEBVER/-gotv1/+gotv1}-1"
+          echo "VER=$VER" >> "$GITHUB_ENV"
+          echo "DEBVER=$DEBVER" >> "$GITHUB_ENV"
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Stage release assets
+        run: |
+          mkdir -p staged
+          cp release-assets/*.deb staged/
+          cp install.sh staged/
+          (cd staged && sha256sum * > SHA256SUMS)
+          ls -la staged
+          for f in \
+            ibus-bamboo_${DEBVER}~22.04_amd64.deb \
+            ibus-bamboo_${DEBVER}~24.04_amd64.deb \
+            ibus-bamboo_${DEBVER}_amd64.deb \
+            libmutter-18-0_*+gotv1_amd64.deb \
+            mutter-common_*+gotv1_all.deb \
+            gir1.2-mutter-18_*+gotv1_amd64.deb \
+            install.sh SHA256SUMS; do
+            compgen -G "staged/$f" >/dev/null || { echo "missing asset: $f"; exit 1; }
+          done
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd staged
+          gh release create "$TAG" --generate-notes \
+            --title "GoTiengViet $VER" \
+            ibus-bamboo_${DEBVER}~22.04_amd64.deb \
+            ibus-bamboo_${DEBVER}~24.04_amd64.deb \
+            ibus-bamboo_${DEBVER}_amd64.deb \
+            libmutter-18-0_*+gotv1_amd64.deb \
+            mutter-common_*+gotv1_all.deb \
+            gir1.2-mutter-18_*+gotv1_amd64.deb \
+            install.sh SHA256SUMS
