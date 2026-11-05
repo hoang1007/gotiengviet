@@ -51,5 +51,7 @@ mv "$work/changelog" "$work/src/debian/changelog"
 arch=$(dpkg --print-architecture)
 package="$work/ibus-bamboo_${version}_${arch}.deb"
 [[ -f "$package" ]] || { echo "Package not found: $package" >&2; exit 1; }
-cp "$package" "$out/"
-echo "Built: $out/$(basename "$package")"
+# Publish under a '.' suffix: GitHub replaces '~' with '.' in release asset names.
+outname="ibus-bamboo_${version//\~/.}_${arch}.deb"
+cp "$package" "$out/$outname"
+echo "Built: $out/$outname"
