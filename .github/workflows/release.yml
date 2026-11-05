@@ -62,7 +62,7 @@ jobs:
           if [[ '${{ matrix.release }}' == '26.04' ]]; then
             test -f "ibus-bamboo_${DEBVER}_amd64.deb"
           else
-            test -f "ibus-bamboo_${DEBVER}~${{ matrix.release }}_amd64.deb"
+            test -f "ibus-bamboo_${DEBVER}.${{ matrix.release }}_amd64.deb"
           fi
 
       - uses: actions/upload-artifact@v4
@@ -133,8 +133,8 @@ jobs:
           (cd staged && sha256sum * > SHA256SUMS)
           ls -la staged
           for f in \
-            ibus-bamboo_${DEBVER}~22.04_amd64.deb \
-            ibus-bamboo_${DEBVER}~24.04_amd64.deb \
+            ibus-bamboo_${DEBVER}.22.04_amd64.deb \
+            ibus-bamboo_${DEBVER}.24.04_amd64.deb \
             ibus-bamboo_${DEBVER}_amd64.deb \
             libmutter-18-0_*+gotv1_amd64.deb \
             mutter-common_*+gotv1_all.deb \
@@ -150,8 +150,8 @@ jobs:
           cd staged
           gh release create "$TAG" --generate-notes \
             --title "GoTiengViet $VER" \
-            ibus-bamboo_${DEBVER}~22.04_amd64.deb \
-            ibus-bamboo_${DEBVER}~24.04_amd64.deb \
+            ibus-bamboo_${DEBVER}.22.04_amd64.deb \
+            ibus-bamboo_${DEBVER}.24.04_amd64.deb \
             ibus-bamboo_${DEBVER}_amd64.deb \
             libmutter-18-0_*+gotv1_amd64.deb \
             mutter-common_*+gotv1_all.deb \

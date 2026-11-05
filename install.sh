@@ -37,7 +37,10 @@ engine_version="0.8.5+gotv1-1"
 if [[ "$VERSION_ID" != 26.04 ]]; then
   engine_version+="~${VERSION_ID}"
 fi
-engine="ibus-bamboo_${engine_version}_${arch}.deb"
+# GitHub lưu asset với tên thay '~' bằng '.', nên tên file công bố dùng '.';
+# version Debian bên trong gói (engine_version) vẫn giữ '~'.
+file_version="${engine_version//\~/.}"
+engine="ibus-bamboo_${file_version}_${arch}.deb"
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/gotv-install.XXXXXXXX")
 trap 'rm -rf "$work"' EXIT
