@@ -218,8 +218,16 @@ func (e *IBusBambooEngine) commitText(str string) {
 	if str == "" {
 		return
 	}
+	// Clients can overwrite unacknowledged commit_string events under
+	// zwp_text_input_v3; leave a gap before sending the next commit.
+	now := time.Now()
+	elapsed := now.UnixNano() - e.lastCommitText
+	minInterval := int64(20 * time.Millisecond)
+	if e.lastCommitText > 0 && elapsed < minInterval {
+		time.Sleep(time.Duration(minInterval - elapsed))
+	}
 	log.Printf("Commit Text [%s]\n", str)
-	var now = time.Now()
+	now = time.Now()
 	e.lastCommitText = now.UnixNano()
 	e.CommitText(ibus.NewText(e.encodeText(str)))
 }

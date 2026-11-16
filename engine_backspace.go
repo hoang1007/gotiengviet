@@ -404,13 +404,12 @@ func (e *IBusBambooEngine) SendBackSpace(n int, gen uint64) {
 	guard := func() bool {
 		return e.isCurrentInputGen(gen) && !e.isPasswordField()
 	}
-	// Gtk/Qt apps have a serious sync issue with fake backspaces
-	// and normal string committing, so we'll not commit right now
-	// but delay until all the sent backspaces got processed.
-	var now = time.Now()
-	var delta = 50*1000*1000 - (now.UnixNano() - e.lastCommitText)
-	if delta > 0 {
-		time.Sleep(time.Duration(delta) * time.Nanosecond)
+	// Let clients process the previous commit before forwarding deletions.
+	now := time.Now()
+	elapsed := now.UnixNano() - e.lastCommitText
+	minDelta := int64(20 * time.Millisecond)
+	if e.lastCommitText > 0 && elapsed < minDelta {
+		time.Sleep(time.Duration(minDelta - elapsed))
 	}
 	if !guard() {
 		return
@@ -448,11 +447,15 @@ func (e *IBusBambooEngine) SendBackSpace(n int, gen uint64) {
 				return
 			}
 			e.ForwardKeyEvent(IBusBackSpace, XkBackspace-8, 0)
+			time.Sleep(1 * time.Millisecond)
 			e.ForwardKeyEvent(IBusBackSpace, XkBackspace-8, IBusReleaseMask)
+			if i < n-1 {
+				time.Sleep(2 * time.Millisecond)
+			}
 		}
-		time.Sleep(time.Duration(n) * (20 + BACKSPACE_INTERVAL) * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 	} else if e.checkInputMode(config.ShiftLeftForwardingIM) {
-		time.Sleep(30 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 		log.Printf("Sendding %d Shift+Left via shiftLeftForwardingIM\n", n)
 
 		for i := 0; i < n; i++ {
@@ -460,11 +463,15 @@ func (e *IBusBambooEngine) SendBackSpace(n int, gen uint64) {
 				return
 			}
 			e.ForwardKeyEvent(IBusLeft, XkLeft-8, IBusShiftMask)
+			time.Sleep(1 * time.Millisecond)
 			e.ForwardKeyEvent(IBusLeft, XkLeft-8, IBusReleaseMask)
+			if i < n-1 {
+				time.Sleep(2 * time.Millisecond)
+			}
 		}
-		time.Sleep(time.Duration(n) * (30 + BACKSPACE_INTERVAL) * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 	} else if e.checkInputMode(config.BackspaceForwardingIM) {
-		time.Sleep(30 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 		log.Printf("Sendding %d backspace via backspaceForwardingIM\n", n)
 
 		for i := 0; i < n; i++ {
@@ -472,9 +479,13 @@ func (e *IBusBambooEngine) SendBackSpace(n int, gen uint64) {
 				return
 			}
 			e.ForwardKeyEvent(IBusBackSpace, XkBackspace-8, 0)
+			time.Sleep(1 * time.Millisecond)
 			e.ForwardKeyEvent(IBusBackSpace, XkBackspace-8, IBusReleaseMask)
+			if i < n-1 {
+				time.Sleep(2 * time.Millisecond)
+			}
 		}
-		time.Sleep(time.Duration(n) * (30 + BACKSPACE_INTERVAL) * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 	} else {
 		fmt.Println("There's something wrong with wmClasses")
 	}
