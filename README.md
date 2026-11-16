@@ -14,6 +14,13 @@ GoTiengViet được phát triển để khắc phục các lỗi này, mang l�
 curl -fsSL https://github.com/hoang1007/gotiengviet/releases/latest/download/install.sh | bash
 ```
 
+Muốn cài đúng một bản đã phát hành thay vì bản mới nhất:
+
+```sh
+curl -fsSL https://github.com/hoang1007/gotiengviet/releases/latest/download/install.sh \
+  | GOTV_RELEASE=release/v0.8.5-gotv2 bash
+```
+
 ### Cài từ mã nguồn
 
 Cài các gói cần thiết:

@@ -36,7 +36,12 @@ jobs:
         run: |
           VER="${VERSION#release/}"
           DEBVER="${VER#v}"
-          DEBVER="${DEBVER/-gotv1/+gotv1}-1"
+          DEBVER="${DEBVER/-gotv/+gotv}-1"
+          EXPECTED=$(scripts/version.sh)
+          if [[ "$DEBVER" != "$EXPECTED" ]]; then
+            echo "Tag $TAG maps to $DEBVER, but VERSION says $EXPECTED." >&2
+            exit 1
+          fi
           echo "VER=$VER" >> "$GITHUB_ENV"
           echo "DEBVER=$DEBVER" >> "$GITHUB_ENV"
 
@@ -71,6 +76,8 @@ jobs:
           path: dist/*.deb
           if-no-files-found: error
 
+  # Mutter's +gotvN revision is independent of the engine's: it tracks the
+  # 570de65 backport, not an engine release.
   build-mutter:
     runs-on: ubuntu-latest
     steps:
@@ -115,7 +122,12 @@ jobs:
         run: |
           VER="${VERSION#release/}"
           DEBVER="${VER#v}"
-          DEBVER="${DEBVER/-gotv1/+gotv1}-1"
+          DEBVER="${DEBVER/-gotv/+gotv}-1"
+          EXPECTED=$(scripts/version.sh)
+          if [[ "$DEBVER" != "$EXPECTED" ]]; then
+            echo "Tag $TAG maps to $DEBVER, but VERSION says $EXPECTED." >&2
+            exit 1
+          fi
           echo "VER=$VER" >> "$GITHUB_ENV"
           echo "DEBVER=$DEBVER" >> "$GITHUB_ENV"
 
