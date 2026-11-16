@@ -31,6 +31,14 @@ func (e *IBusBambooEngine) isPasswordField() bool {
 	return e.contentPurpose == IBusInputPurposePassword || e.contentPurpose == IBusInputPurposePin
 }
 
+// isUrlField reports whether the active input context specifies IBusInputPurposeUrl,
+// where inline auto-completion selections may intercept forwarded backspace events.
+func (e *IBusBambooEngine) isUrlField() bool {
+	e.Lock()
+	defer e.Unlock()
+	return e.contentPurpose == IBusInputPurposeUrl
+}
+
 // setContentType is the shared handler for Properties.Set and the legacy
 // SetContentType method.
 func (e *IBusBambooEngine) setContentType(purpose, hints uint32) {

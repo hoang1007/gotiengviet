@@ -267,6 +267,20 @@ func (e *IBusBambooEngine) applySuffixPatch(oldText, desiredText string, gen uin
 	}
 	nBackSpace, insert := suffixPatch(oldText, desiredText)
 	if nBackSpace > 0 {
+		if e.isUrlField() {
+			// In URL fields, clients frequently maintain an active inline completion
+			// selection following the cursor. Forwarded BackSpace events consume this
+			// selection instead of deleting committed characters.
+			//
+			// Committing a delimiter replaces any active selection and suspends inline
+			// completion matching. We then delete the delimiter along with the target
+			// suffix in the subsequent backspace burst before committing the replacement.
+			e.bsCommitText([]rune(" "))
+			nBackSpace++
+			if !e.isCurrentInputGen(gen) || e.isPasswordField() {
+				return
+			}
+		}
 		e.SendBackSpace(nBackSpace, gen)
 		if !e.isCurrentInputGen(gen) || e.isPasswordField() {
 			return
@@ -280,9 +294,9 @@ func (e *IBusBambooEngine) applySuffixPatch(oldText, desiredText string, gen uin
 
 // updatePreviousTextInBatch drains pending keystrokes before calculating the final
 // desiredText, then emits a single suffixPatch. Draining before deleting ensures
-// rapid keystrokes (like "ddeef") are committed in ONE single Backspace and ONE
-// commitText, preventing intermediate commits that trigger Chromium's commit overwrite
-// in Mutter's deferred done window.
+// rapid keystrokes are coalesced into a single Backspace burst and commitText,
+// preventing intermediate commits from triggering client-side commit overwrites
+// under deferred event windows.
 func (e *IBusBambooEngine) updatePreviousTextInBatch(oldText, newText string, isWordBreakRune bool, gen uint64) {
 	var buffer = []string{newText}
 	if isWordBreakRune {

@@ -1,10 +1,13 @@
 package main
 
 import (
+	"strings"
 	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
+
+	ibus "github.com/BambooEngine/goibus"
 
 	"github.com/godbus/dbus/v5"
 
@@ -186,5 +189,93 @@ func TestSurroundingTextConcurrentWithWorker(t *testing.T) {
 
 	if got := fe.appSnapshot(); !utf8.ValidString(got) {
 		t.Errorf("app buffer is not valid UTF-8: %q", got)
+	}
+}
+
+// autocompleteClient simulates an input field with inline auto-completion.
+// Newly committed text matching a candidate suggestion creates an active
+// selection over the remaining suffix. Forwarded BackSpace events clear
+// that selection prior to altering committed document text.
+type autocompleteClient struct {
+	*fakeEngine
+	suggestion string
+	selection  string
+}
+
+func (c *autocompleteClient) CommitText(text *ibus.Text) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.commitText += text.Text
+	c.selection = ""
+	c.appBuffer += text.Text
+	c.commitLog = append(c.commitLog, "commit:"+text.Text)
+	c.refreshSelectionLocked()
+}
+
+func (c *autocompleteClient) ForwardKeyEvent(keyval, keycode, state uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.forwardKeyEvent = [3]uint32{keyval, keycode, state}
+	if state&IBusReleaseMask != 0 {
+		return
+	}
+	if keyval != IBusBackSpace && keycode != XkBackspace-8 {
+		return
+	}
+	if c.selection != "" {
+		c.selection = ""
+		c.commitLog = append(c.commitLog, "bs:autocomplete")
+		return
+	}
+	r := []rune(c.appBuffer)
+	if len(r) > 0 {
+		c.appBuffer = string(r[:len(r)-1])
+	}
+	c.commitLog = append(c.commitLog, "bs")
+	// Inline suggestions are typically recomputed asynchronously upon content
+	// change rather than synchronously during key bursts. Subsequent BackSpaces
+	// in the same burst therefore operate directly on the underlying buffer.
+}
+
+func (c *autocompleteClient) refreshSelectionLocked() {
+	if strings.HasPrefix(c.suggestion, c.appBuffer) &&
+		len(c.suggestion) > len(c.appBuffer) {
+		c.selection = c.suggestion[len(c.appBuffer):]
+		return
+	}
+	c.selection = ""
+}
+
+// TestBackspaceForwardingUrlAutocomplete verifies that backspace-based suffix
+// rewrites remain accurate when the target field maintains an active inline
+// auto-completion selection.
+func TestBackspaceForwardingUrlAutocomplete(t *testing.T) {
+	cases := []struct {
+		name       string
+		suggestion string
+	}{
+		{"with inline autocomplete selection", "code.example.com/documentation/test"},
+		{"without autocomplete", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fe := NewFakeEngine()
+			fe.simulateAppBuffer = true
+			client := &autocompleteClient{fakeEngine: fe, suggestion: tc.suggestion}
+			cfg := config.DefaultCfg()
+			cfg.DefaultInputMode = config.BackspaceForwardingIM
+			inputMethod := bamboo.ParseInputMethod(cfg.InputMethodDefinitions, cfg.InputMethod)
+			e := NewIbusBambooEngine("test", &cfg, client, bamboo.NewEngine(inputMethod, cfg.Flags))
+			e.shouldEnqueuKeyStrokes = true
+			e.setContentType(IBusInputPurposeUrl, 0)
+
+			typeDirect(e, "cown muwa ngang qua ")
+
+			const want = "cơn mưa ngang qua "
+			if got := fe.appSnapshot(); got != want {
+				t.Fatalf("got %q, want %q (events: %v)",
+					got, want, fe.commitLogSnapshot())
+			}
+		})
 	}
 }
