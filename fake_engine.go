@@ -1,6 +1,9 @@
 package main
 
 import (
+	"fmt"
+	"sync"
+
 	ibus "github.com/BambooEngine/goibus"
 	"github.com/godbus/dbus/v5"
 )
@@ -48,6 +51,7 @@ type IEngine interface {
 }
 
 type fakeEngine struct {
+	mu                  sync.Mutex
 	commitText          string
 	preeditText         string
 	committed           bool
@@ -56,6 +60,30 @@ type fakeEngine struct {
 	isHideLookupTable   bool
 	isReset             bool
 	forwardKeyEvent     [3]uint32
+	simulateAppBuffer   bool
+	appBuffer           string
+	commitLog           []string
+}
+
+func (e *fakeEngine) resetAppBuffer() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.appBuffer = ""
+	e.commitLog = nil
+}
+
+func (e *fakeEngine) appSnapshot() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.appBuffer
+}
+
+func (e *fakeEngine) commitLogSnapshot() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	cp := make([]string, len(e.commitLog))
+	copy(cp, e.commitLog)
+	return cp
 }
 
 func NewFakeEngine() *fakeEngine {
@@ -153,12 +181,38 @@ func (e *fakeEngine) Destroy() *dbus.Error {
 
 // @signal(signature="v")
 func (e *fakeEngine) CommitText(text *ibus.Text) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	e.commitText += text.Text
+	if e.simulateAppBuffer {
+		e.appBuffer += text.Text
+		e.commitLog = append(e.commitLog, "commit:"+text.Text)
+	}
 }
 
 // @signal(signature="uuu")
 func (e *fakeEngine) ForwardKeyEvent(keyval uint32, keycode uint32, state uint32) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	e.forwardKeyEvent = [3]uint32{keyval, keycode, state}
+	if !e.simulateAppBuffer {
+		return
+	}
+	if state&IBusReleaseMask != 0 {
+		return
+	}
+	if keyval == IBusBackSpace || keycode == XkBackspace-8 {
+		r := []rune(e.appBuffer)
+		if len(r) > 0 {
+			e.appBuffer = string(r[:len(r)-1])
+		}
+		e.commitLog = append(e.commitLog, "bs")
+	} else if keyval == IBusLeft && state&IBusShiftMask != 0 {
+		e.commitLog = append(e.commitLog, "shift-left")
+	} else if keyval >= 32 && keyval < 0x10000 {
+		e.appBuffer += string(rune(keyval))
+		e.commitLog = append(e.commitLog, fmt.Sprintf("fwd:%c", keyval))
+	}
 }
 
 // @signal(signature="vubu")
@@ -233,12 +287,19 @@ func (e *fakeEngine) UpdateProperty(prop *ibus.Property) {
 
 // @signal(signature="iu")
 func (e *fakeEngine) DeleteSurroundingText(offset_from_cursor int32, nchars uint32) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	s := []rune(e.commitText)
-	var txt string
-	for _, ch := range s[:len(s)-int(nchars)] {
-		txt += string(ch)
+	if int(nchars) <= len(s) {
+		e.commitText = string(s[:len(s)-int(nchars)])
 	}
-	e.commitText = txt
+	if e.simulateAppBuffer {
+		buf := []rune(e.appBuffer)
+		if int(nchars) <= len(buf) {
+			e.appBuffer = string(buf[:len(buf)-int(nchars)])
+		}
+		e.commitLog = append(e.commitLog, fmt.Sprintf("delSurr:%d", nchars))
+	}
 }
 
 // @signal()

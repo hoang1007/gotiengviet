@@ -37,6 +37,7 @@ import (
 
 type IBusBambooEngine struct {
 	sync.Mutex
+	preeditorMu sync.Mutex
 	IEngine
 	preeditor              bamboo.IEngine
 	engineName             string
@@ -162,7 +163,9 @@ func (e *IBusBambooEngine) FocusOut() *dbus.Error {
 func (e *IBusBambooEngine) Reset() *dbus.Error {
 	fmt.Print("Reset.\n")
 	if e.checkInputMode(config.PreeditIM) {
+		e.preeditorMu.Lock()
 		e.preeditor.Reset()
+		e.preeditorMu.Unlock()
 	}
 	return nil
 }
@@ -180,14 +183,15 @@ func (e *IBusBambooEngine) Disable() *dbus.Error {
 
 // @method(in_signature="vuu")
 func (e *IBusBambooEngine) SetSurroundingText(text dbus.Variant, cursorPos uint32, anchorPos uint32) *dbus.Error {
+	e.Lock()
 	if !e.isSurroundingTextReady {
-		//fmt.Println("Surrounding Text is not ready yet.")
+		e.Unlock()
 		return nil
 	}
-	e.Lock()
+	e.isSurroundingTextReady = false
+	e.Unlock()
+
 	defer func() {
-		e.Unlock()
-		e.isSurroundingTextReady = false
 		if err := recover(); err != nil {
 			fmt.Println(err)
 		}
@@ -200,6 +204,8 @@ func (e *IBusBambooEngine) SetSurroundingText(text dbus.Variant, cursorPos uint3
 		}
 		var cs = s[:cursorPos]
 		fmt.Println("Surrounding Text: ", string(cs))
+		e.preeditorMu.Lock()
+		defer e.preeditorMu.Unlock()
 		e.preeditor.Reset()
 		for i := len(cs) - 1; i >= 0; i-- {
 			// workaround for spell checking

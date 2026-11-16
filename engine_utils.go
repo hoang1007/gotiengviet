@@ -42,7 +42,7 @@ var dictionary = map[string]bool{}
 var emojiTrie = NewTrie()
 
 func GetIBusEngineCreator() func(*dbus.Conn, string) dbus.ObjectPath {
-	go keyPressCapturing()
+	go keyPressCapturing(keyPressChan)
 
 	return func(conn *dbus.Conn, ngName string) dbus.ObjectPath {
 		var ngGroupName = strings.Split(ngName, "::")[0]
@@ -113,6 +113,7 @@ func initConfigFiles(engineName string) {
 var keyPressHandler = func(keyVal, keyCode, state uint32, gen uint64) {}
 var keyPressChan = make(chan keyPressEvent, 100)
 var lenKeyChan int32
+var workerBusy int32
 
 // keyPressEvent is one enqueued keystroke tagged with the focus/field
 // generation it was pressed under (see engine.go inputGen). The consumer
@@ -123,13 +124,19 @@ type keyPressEvent struct {
 	gen                    uint64
 }
 
-func keyPressCapturing() {
-	for event := range keyPressChan {
-		atomic.StoreInt32(&lenKeyChan, int32(len(keyPressChan)))
+// keyPressCapturing consumes one engine's keystroke queue. Production starts
+// a single worker for the package channel; tests run the same function against
+// a private channel, so the live producer/consumer path is exercised without
+// sharing global state between tests.
+func keyPressCapturing(ch chan keyPressEvent) {
+	for event := range ch {
+		atomic.StoreInt32(&workerBusy, 1)
+		atomic.StoreInt32(&lenKeyChan, int32(len(ch)))
 
 		keyPressHandler(event.keyVal, event.keyCode, event.state, event.gen)
 
 		atomic.AddInt32(&lenKeyChan, -1)
+		atomic.StoreInt32(&workerBusy, 0)
 	}
 }
 
@@ -154,9 +161,12 @@ func (e *IBusBambooEngine) invalidatePendingKeys() {
 	e.inputGen++
 	e.isSurroundingTextReady = false
 	e.shouldRestoreKeyStrokes = false
-	e.preeditor.Reset()
 	e.resetFakeBackspace()
 	e.Unlock()
+
+	e.preeditorMu.Lock()
+	e.preeditor.Reset()
+	e.preeditorMu.Unlock()
 
 	// No drain here: blindly popping keyPressChan could discard a legitimate
 	// key enqueued with the new generation right after the bump. Instead the

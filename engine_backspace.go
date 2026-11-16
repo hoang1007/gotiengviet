@@ -24,8 +24,8 @@ import (
 	"ibus-bamboo/config"
 	"log"
 	"strings"
+	"sync/atomic"
 	"time"
-	"unicode/utf8"
 
 	"github.com/BambooEngine/bamboo-core"
 	"github.com/godbus/dbus/v5"
@@ -35,9 +35,13 @@ const BACKSPACE_INTERVAL = 0
 
 func (e *IBusBambooEngine) bsProcessKeyEvent(keyVal uint32, keyCode uint32, state uint32) (bool, *dbus.Error) {
 	if isMovementKey(keyVal) {
+		e.preeditorMu.Lock()
 		e.preeditor.Reset()
+		e.preeditorMu.Unlock()
 		e.resetFakeBackspace()
+		e.Lock()
 		e.isSurroundingTextReady = true
+		e.Unlock()
 		return false, nil
 	}
 	// GOTV: capture the focus/field generation at entry, before any wait or
@@ -45,18 +49,26 @@ func (e *IBusBambooEngine) bsProcessKeyEvent(keyVal uint32, keyCode uint32, stat
 	// the field that happens to be focused later).
 	var gen = e.currentInputGen()
 	var keyRune = rune(keyVal)
-	if e.config.IBflags&config.IBmacroEnabled == 0 && len(keyPressChan) == 0 && e.getRawKeyLen() == 0 && !inKeyList(e.preeditor.GetInputMethod().AppendingKeys, keyRune) {
-		e.updateLastKeyWithShift(keyVal, state)
-		if e.preeditor.CanProcessKey(keyRune) && isValidState(state) {
-			e.isFirstTimeSendingBS = true
-			if state&IBusLockMask != 0 {
-				keyRune = e.toUpper(keyRune)
+	ch := keyPressChan
+	if !e.checkInputMode(config.BackspaceForwardingIM) && e.config.IBflags&config.IBmacroEnabled == 0 && len(ch) == 0 && atomic.LoadInt32(&workerBusy) == 0 {
+		e.preeditorMu.Lock()
+		if len(ch) == 0 && atomic.LoadInt32(&workerBusy) == 0 && e.getRawKeyLen() == 0 && !inKeyList(e.preeditor.GetInputMethod().AppendingKeys, keyRune) {
+			e.updateLastKeyWithShift(keyVal, state)
+			if e.preeditor.CanProcessKey(keyRune) && isValidState(state) {
+				e.isFirstTimeSendingBS = true
+				if state&IBusLockMask != 0 {
+					keyRune = e.toUpper(keyRune)
+				}
+				e.preeditor.ProcessKey(keyRune, bamboo.VietnameseMode)
+				str := e.getPreeditString()
+				e.preeditorMu.Unlock()
+				e.bsCommitText([]rune(str))
+				return true, nil
 			}
-			e.preeditor.ProcessKey(keyRune, bamboo.VietnameseMode)
-			e.bsCommitText([]rune(e.getPreeditString()))
-			return true, nil
+			e.preeditorMu.Unlock()
+			return false, nil
 		}
-		return false, nil
+		e.preeditorMu.Unlock()
 	}
 
 	if e.shouldEnqueuKeyStrokes {
@@ -68,23 +80,31 @@ func (e *IBusBambooEngine) bsProcessKeyEvent(keyVal uint32, keyCode uint32, stat
 					return false, nil
 				} else {
 					sleep()
+					e.preeditorMu.Lock()
 					if e.getRawKeyLen() > 0 {
 						if e.shouldFallbackToEnglish(true) {
 							e.preeditor.RestoreLastWord(false)
 						}
 						e.preeditor.RemoveLastChar(false)
 					}
+					e.preeditorMu.Unlock()
 				}
 				return false, nil
 			}
 			if keyVal == IBusTab {
 				sleep()
-				if ok, _ := e.getMacroText(); !ok {
+				e.preeditorMu.Lock()
+				ok, _ := e.getMacroText()
+				if !ok {
 					e.preeditor.Reset()
+					e.preeditorMu.Unlock()
 					return false, nil
 				}
+				e.preeditorMu.Unlock()
 			}
+			e.preeditorMu.Lock()
 			isValidKey := isValidState(state) && e.isValidKeyVal(keyVal)
+			e.preeditorMu.Unlock()
 			if !isValidKey {
 				sleep()
 				// GOTV: same stale/password drop semantics as the queued path —
@@ -100,7 +120,7 @@ func (e *IBusBambooEngine) bsProcessKeyEvent(keyVal uint32, keyCode uint32, stat
 		// if the main thread is busy processing, the keypress events come all mixed up
 		// so we enqueue these keypress events (tagged with the entry focus
 		// generation) and process them sequentially on another thread
-		keyPressChan <- keyPressEvent{keyVal, keyCode, state, gen}
+		ch <- keyPressEvent{keyVal, keyCode, state, gen}
 		return true, nil
 	} else {
 		// GOTV: same stale/password drop semantics as the queued path.
@@ -124,6 +144,8 @@ func (e *IBusBambooEngine) keyPressForwardHandler(keyVal, keyCode, state uint32,
 }
 
 func (e *IBusBambooEngine) keyPressHandler(keyVal, keyCode, state uint32, gen uint64) bool {
+	e.preeditorMu.Lock()
+	defer e.preeditorMu.Unlock()
 	// GOTV: a focus/field change while the key was queued invalidates it — it
 	// belongs to the previous field, never compose/rewrite it into the new one.
 	if !e.isCurrentInputGen(gen) {
@@ -223,119 +245,128 @@ func (e *IBusBambooEngine) shouldAppendDeadKey(newText, oldText string) bool {
 	return false
 }
 
-// updatePreviousTextInBatch applies one key's committed-text update and
-// batch-drains every keystroke already queued, committing the whole word in ONE
-// commitText at the next word break (or when the queue drains). Batching
-// avoids the stand-alone multi-run commit that would otherwise land right after
-// forwarded backspaces, which GTK/Qt drop at fast typing rates — the source of
-// the reported character loss (thấy→thy, mất→mt).
-func (e *IBusBambooEngine) updatePreviousTextInBatch(oldText, newText string, isWordBreakRune bool, gen uint64) {
-	offsetRunes, nBackSpace := e.getOffsetRunes(newText, oldText)
+// suffixPatch computes the minimal suffix diff between oldText and newText:
+// it returns the number of backspaces needed to erase differing runes at the end
+// of oldText, and the suffix string to insert to produce newText.
+func suffixPatch(oldText, newText string) (backspaces int, insert string) {
+	oldRunes := []rune(oldText)
+	newRunes := []rune(newText)
+
+	i := 0
+	for i < len(oldRunes) && i < len(newRunes) && oldRunes[i] == newRunes[i] {
+		i++
+	}
+	return len(oldRunes) - i, string(newRunes[i:])
+}
+
+// applySuffixPatch calculates the exact backspaces and commit string to transform
+// oldText to desiredText, emitting at most ONE backspace burst and ONE commitText.
+func (e *IBusBambooEngine) applySuffixPatch(oldText, desiredText string, gen uint64) {
+	if !e.isCurrentInputGen(gen) || e.isPasswordField() {
+		return
+	}
+	nBackSpace, insert := suffixPatch(oldText, desiredText)
 	if nBackSpace > 0 {
 		e.SendBackSpace(nBackSpace, gen)
-		// GOTV: re-validate after the (long) backspace window — the field may
-		// have changed or become a password field mid-rewrite.
 		if !e.isCurrentInputGen(gen) || e.isPasswordField() {
 			return
 		}
 	}
-	var buffer = []string{string(offsetRunes)}
+	if len(insert) > 0 {
+		log.Printf("\nUpdating Previous Text %s ---> %s (bs=%d, commit=%q)\n", oldText, desiredText, nBackSpace, insert)
+		e.bsCommitText([]rune(insert))
+	}
+}
+
+// updatePreviousTextInBatch drains pending keystrokes before calculating the final
+// desiredText, then emits a single suffixPatch. Draining before deleting ensures
+// rapid keystrokes (like "ddeef") are committed in ONE single Backspace and ONE
+// commitText, preventing intermediate commits that trigger Chromium's commit overwrite
+// in Mutter's deferred done window.
+func (e *IBusBambooEngine) updatePreviousTextInBatch(oldText, newText string, isWordBreakRune bool, gen uint64) {
+	var buffer = []string{newText}
 	if isWordBreakRune {
 		e.preeditor.Reset()
 		buffer = append(buffer, "")
 	}
-	// isDirty means containing runes that are not committed
-	var isDirty = false
-	for i := 0; i < len(keyPressChan); i++ {
-		var keyEvents = <-keyPressChan
-		// GOTV: drop keys queued under a previous focus generation — never
-		// compose them against the field that now has focus.
-		if !e.isCurrentInputGen(keyEvents.gen) {
-			continue
-		}
-		var keyVal, keyCode, state = keyEvents.keyVal, keyEvents.keyCode, keyEvents.state
-		isValidKey := isValidState(state) && e.isValidKeyVal(keyVal)
-		if isValidKey {
-			var commitText, isWordBreakRune0 = e.getCommitText(keyVal, keyCode, state)
-			buffer[len(buffer)-1] = commitText
-			if isWordBreakRune0 {
-				buffer = append(buffer, "")
+	ch := keyPressChan
+drainLoop:
+	for {
+		select {
+		case keyEvents, ok := <-ch:
+			if !ok {
+				break drainLoop
 			}
-			isDirty = true
-		} else {
-			if isDirty {
-				e.batchCommit(oldText, strings.Join(buffer, ""), nBackSpace, isWordBreakRune, gen)
-				buffer = []string{""}
+			// GOTV: drop keys queued under a previous focus generation — never
+			// compose them against the field that now has focus.
+			if !e.isCurrentInputGen(keyEvents.gen) {
+				continue
 			}
-			e.ForwardKeyEvent(keyVal, keyCode, state)
+			var keyVal, keyCode, state = keyEvents.keyVal, keyEvents.keyCode, keyEvents.state
+			if isMovementKey(keyVal) {
+				desiredText := strings.Join(buffer, "")
+				e.applySuffixPatch(oldText, desiredText, gen)
+				e.preeditor.Reset()
+				e.resetFakeBackspace()
+				e.Lock()
+				e.isSurroundingTextReady = true
+				e.Unlock()
+				e.ForwardKeyEvent(keyVal, keyCode, state)
+				return
+			}
+			if keyVal == IBusBackSpace {
+				desiredText := strings.Join(buffer, "")
+				e.applySuffixPatch(oldText, desiredText, gen)
+				if e.getRawKeyLen() > 0 {
+					if e.config.IBflags&config.IBautoNonVnRestore == 0 {
+						e.preeditor.RemoveLastChar(false)
+					} else {
+						e.preeditor.RemoveLastChar(true)
+					}
+					var bsNewText = e.getPreeditString()
+					e.applySuffixPatch(desiredText, bsNewText, gen)
+				} else {
+					e.ForwardKeyEvent(keyVal, keyCode, state)
+				}
+				return
+			}
+			if keyVal == IBusTab {
+				desiredText := strings.Join(buffer, "")
+				e.applySuffixPatch(oldText, desiredText, gen)
+				_, oldMacText := e.getMacroText()
+				e.preeditor.Reset()
+				if oldMacText != "" {
+					e.applySuffixPatch(desiredText, oldMacText, gen)
+				} else {
+					e.ForwardKeyEvent(keyVal, keyCode, state)
+				}
+				return
+			}
+			isValidKey := isValidState(state) && e.isValidKeyVal(keyVal)
+			if isValidKey {
+				var commitText, isWordBreakRune0 = e.getCommitText(keyVal, keyCode, state)
+				buffer[len(buffer)-1] = commitText
+				if isWordBreakRune0 {
+					e.preeditor.Reset()
+					buffer = append(buffer, "")
+				}
+			} else {
+				desiredText := strings.Join(buffer, "")
+				e.applySuffixPatch(oldText, desiredText, gen)
+				e.ForwardKeyEvent(keyVal, keyCode, state)
+				return
+			}
+		default:
+			break drainLoop
 		}
 	}
-	if isDirty {
-		e.batchCommit(oldText, strings.Join(buffer, ""), nBackSpace, isWordBreakRune, gen)
-		return
-	}
-	log.Printf("Updating Previous Text %s ---> %s\n", oldText, newText)
-	e.bsCommitText(offsetRunes)
+	desiredText := strings.Join(buffer, "")
+	e.applySuffixPatch(oldText, desiredText, gen)
 }
 
-// batchCommit compares two given text and commit the right outer text, with
-// backspaces if necessary:
-// toi - tôi = ôi + 2 BS
-// <space> - tôi = tôi
-func (e *IBusBambooEngine) batchCommit(oldText string, newText string, nBackSpace int, isWordBreakRune bool, gen uint64) {
-	// GOTV: re-validate before emitting anything — abort if the field changed
-	// or became a password field while draining/rewriting.
-	if !e.isCurrentInputGen(gen) || e.isPasswordField() {
-		return
-	}
-	fullRunes := []rune(newText)
-	if len(fullRunes) == 0 {
-		return
-	}
-	patchedRunes, patchedBackSpace := e.getOffsetRunes(newText, oldText)
-	if isWordBreakRune {
-		e.bsCommitText(patchedRunes)
-		return
-	}
-	if patchedBackSpace > nBackSpace {
-		e.SendBackSpace(patchedBackSpace-nBackSpace, gen)
-	} else if patchedBackSpace < nBackSpace {
-		var offset = utf8.RuneCountInString(oldText) - nBackSpace
-		patchedRunes = fullRunes[offset:]
-	}
-	log.Printf("\nUpdating Previous Text %s ---> %s\n", oldText, newText)
-	fmt.Print("====================================\n\n")
-	e.bsCommitText(patchedRunes)
-}
-
-// updatePreviousText applies a rewrite immediately (no deferral) — used only
-// by Backspace/Tab key handling where the user expects the change at once.
+// updatePreviousText applies a rewrite immediately via suffixPatch.
 func (e *IBusBambooEngine) updatePreviousText(oldText, newText string, gen uint64) {
-	offsetRunes, nBackSpace := e.getOffsetRunes(newText, oldText)
-	if nBackSpace > 0 {
-		if !e.isCurrentInputGen(gen) || e.isPasswordField() {
-			return
-		}
-		e.SendBackSpace(nBackSpace, gen)
-	}
-	if !e.isCurrentInputGen(gen) || e.isPasswordField() {
-		return
-	}
-	log.Printf("Updating Previous Text %s ---> %s\n", oldText, newText)
-	e.bsCommitText(offsetRunes)
-}
-
-// getOffsetRunes returns the right outer text and number of pending backspaces
-func (e *IBusBambooEngine) getOffsetRunes(newText, oldText string) ([]rune, int) {
-	var oldRunes = []rune(oldText)
-	var newRunes = []rune(newText)
-	var nBackSpace = 0
-	var offset = e.getPreeditOffset(newRunes, oldRunes)
-	if offset < len(oldRunes) {
-		nBackSpace += len(oldRunes) - offset
-	}
-
-	return newRunes[offset:], nBackSpace
+	e.applySuffixPatch(oldText, newText, gen)
 }
 
 func (e *IBusBambooEngine) SendBackSpace(n int, gen uint64) {
