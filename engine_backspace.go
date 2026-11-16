@@ -271,12 +271,23 @@ func suffixPatch(oldText, newText string) (backspaces int, insert string) {
 }
 
 // applySuffixPatch rewrites oldText to desiredText using a suffix patch.
+// URL fields receive a delimiter first to clear inline completion.
 func (e *IBusBambooEngine) applySuffixPatch(oldText, desiredText string, gen uint64) {
 	if !e.isCurrentInputGen(gen) || e.isPasswordField() {
 		return
 	}
 	nBackSpace, insert := suffixPatch(oldText, desiredText)
 	if nBackSpace > 0 {
+		if e.isUrlField() {
+			// Inline completion selections consume forwarded Backspace events.
+			// A delimiter replaces the selection and suspends completion matching;
+			// delete it together with the suffix before committing the replacement.
+			e.bsCommitText([]rune(" "))
+			nBackSpace++
+			if !e.isCurrentInputGen(gen) || e.isPasswordField() {
+				return
+			}
+		}
 		e.SendBackSpace(nBackSpace, gen)
 		if !e.isCurrentInputGen(gen) || e.isPasswordField() {
 			return
