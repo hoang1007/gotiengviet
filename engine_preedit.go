@@ -218,8 +218,18 @@ func (e *IBusBambooEngine) commitText(str string) {
 	if str == "" {
 		return
 	}
-	log.Printf("Commit Text [%s]\n", str)
+	// Keep a small gap between consecutive commits: some clients coalesce
+	// commit_string until the previous event is acknowledged (e.g. Chromium/
+	// Electron via zwp_text_input_v3 under Mutter's defer_done idle callback),
+	// so back-to-back commits can overwrite each other and drop characters.
 	var now = time.Now()
+	var elapsed = now.UnixNano() - e.lastCommitText
+	var minInterval = int64(20 * time.Millisecond)
+	if e.lastCommitText > 0 && elapsed < minInterval {
+		time.Sleep(time.Duration(minInterval - elapsed))
+	}
+	log.Printf("Commit Text [%s]\n", str)
+	now = time.Now()
 	e.lastCommitText = now.UnixNano()
 	e.CommitText(ibus.NewText(e.encodeText(str)))
 }
