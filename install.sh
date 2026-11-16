@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
-# Install the prebuilt GoTiengViet release on Ubuntu 22.04, 24.04 or 26.04 (amd64).
+# Install the latest prebuilt GoTiengViet release on Ubuntu 22.04, 24.04 or
+# 26.04 (amd64). Set GOTV_RELEASE=release/v0.8.5-gotv2 to pin a release.
 #
 # Mutter 570de65 is only needed on 26.04 (mutter 50.0–50.3). Ubuntu 22.04
 # (mutter 42.x) and 24.04 (mutter 46.x) already forward IME key events with a
 # real keyboard device, so they install the engine only.
 set -euo pipefail
 
-release=release/v0.8.5-gotv1
-base="https://github.com/hoang1007/gotiengviet/releases/download/$release"
+if [[ -n "${GOTV_RELEASE:-}" ]]; then
+  base="https://github.com/hoang1007/gotiengviet/releases/download/${GOTV_RELEASE}"
+else
+  base="https://github.com/hoang1007/gotiengviet/releases/latest/download"
+fi
 mutter_base=50.1-0ubuntu2.5
 mutter_version="${mutter_base}+gotv1"
 mutter_lib="libmutter-18-0_${mutter_version}_amd64.deb"
@@ -31,23 +35,31 @@ for cmd in curl sha256sum dpkg dpkg-deb sudo apt-get; do
   command -v "$cmd" >/dev/null || die "Thiếu lệnh $cmd."
 done
 
-engine_version="0.8.5+gotv1-1"
-# 26.04 giữ tên gói cũ để không phá bản phát hành hiện tại. Các bản LTS cũ
-# dùng hậu tố ~<release> để tránh cài nhầm binary build trên 26.04.
-if [[ "$VERSION_ID" != 26.04 ]]; then
-  engine_version+="~${VERSION_ID}"
-fi
-# GitHub lưu asset với tên thay '~' bằng '.', nên tên file công bố dùng '.';
-# version Debian bên trong gói (engine_version) vẫn giữ '~'.
-file_version="${engine_version//\~/.}"
-engine="ibus-bamboo_${file_version}_${arch}.deb"
-
 work=$(mktemp -d "${TMPDIR:-/tmp}/gotv-install.XXXXXXXX")
 trap 'rm -rf "$work"' EXIT
 curl -fsSL "$base/SHA256SUMS" -o "$work/SHA256SUMS" \
   || die 'Không tải được thông tin bản phát hành.'
-grep -Fq "  $engine" "$work/SHA256SUMS" \
-  || die "Bản phát hành $release chưa có gói cho Ubuntu $VERSION_ID ($engine)."
+
+# Chọn gói engine từ SHA256SUMS thay vì hardcode phiên bản. Bản 22.04/24.04
+# được công bố với hậu tố ".<release>" (dấu '~' trong version bị GitHub đổi
+# thành '.'), còn 26.04 dùng tên trần.
+find_engine() {
+  local name
+  while read -r _ name; do
+    [[ "$name" == ibus-bamboo_*_"${arch}".deb ]] || continue
+    if [[ "$VERSION_ID" == 26.04 ]]; then
+      [[ "$name" == *.[0-9][0-9].[0-9][0-9]_"${arch}".deb ]] && continue
+    else
+      [[ "$name" == *."${VERSION_ID}"_"${arch}".deb ]] || continue
+    fi
+    printf '%s\n' "$name"
+    return 0
+  done < "$work/SHA256SUMS"
+  return 1
+}
+
+engine=$(find_engine) \
+  || die "Bản phát hành ${GOTV_RELEASE:-mới nhất} chưa có gói cho Ubuntu $VERSION_ID ($arch)."
 
 download() {
   local name=$1
@@ -57,15 +69,18 @@ download() {
 }
 
 check_deb() {
-  local file=$1 package=$2 version=$3 arch=$4
+  local file=$1 package=$2 arch=$3 version=${4:-}
   [[ $(dpkg-deb -f "$work/$file" Package) == "$package" && \
-     $(dpkg-deb -f "$work/$file" Version) == "$version" && \
      $(dpkg-deb -f "$work/$file" Architecture) == "$arch" ]] \
     || die "Thông tin gói không đúng: $file."
+  if [[ -n "$version" ]]; then
+    [[ $(dpkg-deb -f "$work/$file" Version) == "$version" ]] \
+      || die "Sai phiên bản gói: $file."
+  fi
 }
 
 download "$engine"
-check_deb "$engine" ibus-bamboo "$engine_version" "$arch"
+check_deb "$engine" ibus-bamboo "$arch"
 
 patch_mutter=0
 sync_mutter=0
@@ -118,13 +133,13 @@ if [[ "$VERSION_ID" == 26.04 ]]; then
     if (( patch_mutter )); then
       download "$mutter_lib"
       download "$mutter_common"
-      check_deb "$mutter_lib" libmutter-18-0 "$mutter_version" amd64
-      check_deb "$mutter_common" mutter-common "$mutter_version" all
+      check_deb "$mutter_lib" libmutter-18-0 amd64 "$mutter_version"
+      check_deb "$mutter_common" mutter-common all "$mutter_version"
       packages+=("$work/$mutter_lib" "$work/$mutter_common")
     fi
     if [[ "$gir_status" == installed && "$gir_version" != "$mutter_version" ]]; then
       download "$mutter_gir"
-      check_deb "$mutter_gir" gir1.2-mutter-18 "$mutter_version" amd64
+      check_deb "$mutter_gir" gir1.2-mutter-18 amd64 "$mutter_version"
       packages+=("$work/$mutter_gir")
     fi
   else

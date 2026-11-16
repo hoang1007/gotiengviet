@@ -6,7 +6,7 @@
 #
 # Env:
 #   GOTV_RELEASE=22.04|24.04  package version gets a ~<release> suffix
-#                             (26.04 and unset keep the public 0.8.5+gotv1-1 name)
+#                             (26.04 and unset keep the VERSION file's name)
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -28,7 +28,7 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/gotv-build.XXXXXXXX")
 trap 'rm -rf "$work"' EXIT
 mkdir "$work/src"
 
-version="0.8.5+gotv1-1"
+version=$("$root/scripts/version.sh")
 if [[ -n "$release" && "$release" != 26.04 ]]; then
   version+="~${release}"
 fi
