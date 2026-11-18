@@ -71,6 +71,47 @@ func (e *IBusBambooEngine) bsProcessKeyEvent(keyVal uint32, keyCode uint32, stat
 	}
 
 	if e.shouldEnqueuKeyStrokes {
+		// GOTV: keys that can never form Vietnamese text (Ctrl/Alt/Super chords,
+		// F5/Enter/Escape/...) must go back unhandled so the shortcut stays on the
+		// native path — re-injecting a delayed press tears press/release ordering,
+		// so a busy-queue Ctrl+W can type a bare 'w' (gotv2 Wayland regression).
+		if e.checkInputMode(config.BackspaceForwardingIM) {
+			e.preeditorMu.Lock()
+			isValidKey := e.isPrintableKey(state, keyVal)
+			e.preeditorMu.Unlock()
+			if !isValidKey {
+				// FIFO barrier: pass through only once every queued key is drained.
+				// A wedged worker (3s timeout) swallows the key rather than let it
+				// overtake pending text.
+				barrier := make(chan struct{})
+				ch <- keyPressEvent{barrier: barrier}
+				select {
+				case <-barrier:
+				case <-time.After(3 * time.Second):
+					log.Printf("GOTV: shortcut pass-through barrier timed out (key 0x%04x) — swallowed", keyVal)
+					return true, nil
+				}
+				// Recheck after the drain: plain Tab only becomes valid once the
+				// queued macro text (e.g. "vn") has been composed.
+				e.preeditorMu.Lock()
+				isValidKey = e.isPrintableKey(state, keyVal)
+				e.preeditorMu.Unlock()
+				if isValidKey && e.isCurrentInputGen(gen) && !e.isPasswordField() {
+					ch <- keyPressEvent{keyVal: keyVal, keyCode: keyCode, state: state, gen: gen}
+					return true, nil
+				}
+				// The shortcut is about to act on the app; flush the in-flight word.
+				e.preeditorMu.Lock()
+				e.preeditor.Reset()
+				e.preeditorMu.Unlock()
+				// Field may have changed while we waited.
+				if !e.isCurrentInputGen(gen) || e.isPasswordField() {
+					return true, nil
+				}
+				e.updateLastKeyWithShift(keyVal, state)
+				return false, nil
+			}
+		}
 		// WARNING: don't use ForwardKeyEvent api in XTestFakeKeyEvent/SurroundingText mode
 		if e.checkInputMode(config.XTestFakeKeyEventIM) || e.checkInputMode(config.SurroundingTextIM) {
 			if keyVal == IBusBackSpace {
@@ -320,6 +361,12 @@ drainLoop:
 		case keyEvents, ok := <-ch:
 			if !ok {
 				break drainLoop
+			}
+			// GOTV: a barrier element acks that everything before it has been
+			// processed; it never composes or forwards anything.
+			if keyEvents.barrier != nil {
+				close(keyEvents.barrier)
+				continue
 			}
 			// GOTV: drop keys queued under a previous focus generation — never
 			// compose them against the field that now has focus.

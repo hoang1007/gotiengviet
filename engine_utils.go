@@ -119,12 +119,20 @@ var workerBusy int32
 type keyPressEvent struct {
 	keyVal, keyCode, state uint32
 	gen                    uint64
+	// barrier, when set, is ack'd by the worker only after every key enqueued
+	// ahead of it has been processed; it is never composed or forwarded.
+	barrier chan struct{}
 }
 
 // keyPressCapturing consumes queued keystrokes with a single worker.
 // Tests supply a private channel but temporarily replace package globals.
 func keyPressCapturing(ch chan keyPressEvent) {
 	for event := range ch {
+		// GOTV: the barrier only acks the drain; never composed or forwarded.
+		if event.barrier != nil {
+			close(event.barrier)
+			continue
+		}
 		atomic.StoreInt32(&workerBusy, 1)
 		atomic.StoreInt32(&lenKeyChan, int32(len(ch)))
 
